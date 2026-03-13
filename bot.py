@@ -3,7 +3,7 @@ import asyncio
 import logging
 import sqlite3
 from contextlib import closing
-from typing import Optional
+from typing import Optional, Any
 
 import replicate
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -28,10 +28,13 @@ if not REPLICATE_API_TOKEN:
 os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 MODEL = "meta/musicgen:671ac645ce5e552c63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
-DB_PATH = "bot_data.db"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "bot_data.db")
 
 START_COINS = 30
 MUSIC_PRICE = 10
+MAX_PROMPT_LENGTH = 300
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -110,23 +113,16 @@ def update_user_info(user_id: int, username: Optional[str], first_name: Optional
 
 def try_spend_coins(user_id: int, amount: int) -> bool:
     with closing(get_db()) as conn:
-        row = conn.execute(
-            "SELECT coins FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-
-        if row is None:
-            return False
-
-        if row["coins"] < amount:
-            return False
-
-        conn.execute(
-            "UPDATE users SET coins = coins - ? WHERE user_id = ?",
-            (amount, user_id),
+        cursor = conn.execute(
+            """
+            UPDATE users
+            SET coins = coins - ?
+            WHERE user_id = ? AND coins >= ?
+            """,
+            (amount, user_id, amount),
         )
         conn.commit()
-        return True
+        return cursor.rowcount > 0
 
 
 def refund_coins(user_id: int, amount: int):
@@ -151,17 +147,18 @@ def increment_generation(user_id: int):
         conn.commit()
 
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup(
+def main_menu_keyboard(waiting_for_prompt: bool = False):
+    rows = [
+        [InlineKeyboardButton("🎵 Create Music", callback_data="create_music")],
         [
-            [InlineKeyboardButton("🎵 Create Music", callback_data="create_music")],
-            [
-                InlineKeyboardButton("🪙 Balance", callback_data="balance"),
-                InlineKeyboardButton("ℹ Help", callback_data="help"),
-            ],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_prompt")],
-        ]
-    )
+            InlineKeyboardButton("🪙 Balance", callback_data="balance"),
+            InlineKeyboardButton("ℹ Help", callback_data="help"),
+        ],
+    ]
+    if waiting_for_prompt:
+        rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_prompt")])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def build_prompt_help():
@@ -175,22 +172,47 @@ def build_prompt_help():
     )
 
 
-def get_output_url(output) -> Optional[str]:
+def extract_url(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        return value
+
+    url_attr = getattr(value, "url", None)
+    if callable(url_attr):
+        try:
+            result = url_attr()
+            if isinstance(result, str):
+                return result
+        except Exception:
+            return None
+    elif isinstance(url_attr, str):
+        return url_attr
+
+    return None
+
+
+def get_output_url(output: Any) -> Optional[str]:
     if output is None:
         return None
 
-    if isinstance(output, str):
-        return output
+    direct = extract_url(output)
+    if direct:
+        return direct
 
     if isinstance(output, list) and output:
-        first = output[0]
-        if isinstance(first, str):
-            return first
-        if hasattr(first, "url"):
-            return first.url()
+        for item in output:
+            item_url = extract_url(item)
+            if item_url:
+                return item_url
 
-    if hasattr(output, "url"):
-        return output.url()
+    if isinstance(output, dict):
+        for key in ("url", "audio", "output", "file"):
+            possible = output.get(key)
+            possible_url = extract_url(possible)
+            if possible_url:
+                return possible_url
 
     return None
 
@@ -222,23 +244,28 @@ async def animated_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mess
         "🥁 Beat layering",
         "🎹 Finalizing track",
     ]
+
     i = 0
     try:
         while True:
             text = frames[i % len(frames)]
+
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=text,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Status edit error: %s", e)
 
             try:
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_AUDIO)
-            except Exception:
-                pass
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_AUDIO,
+                )
+            except Exception as e:
+                logger.debug("Chat action error: %s", e)
 
             i += 1
             await asyncio.sleep(2)
@@ -246,16 +273,25 @@ async def animated_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mess
         raise
 
 
-async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str):
+async def send_main_menu(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    waiting_for_prompt: bool = False,
+):
     await context.bot.send_message(
         chat_id=chat_id,
         text=text,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(waiting_for_prompt),
     )
 
 
 async def show_balance(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     user = get_user(user_id)
+    if user is None:
+        await send_main_menu(chat_id, context, "❌ Foydalanuvchi topilmadi.")
+        return
+
     text = (
         "🪙 Sizning balansingiz\n\n"
         f"Coin: {user['coins']}\n"
@@ -263,10 +299,17 @@ async def show_balance(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user_id
         f"1 ta music narxi: {MUSIC_PRICE} coin\n\n"
         f"Boshlang‘ich bonus: {START_COINS} coin"
     )
-    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=main_menu_keyboard())
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None or update.message is None:
+        return
+
     user = update.effective_user
     db_user = get_or_create_user(user.id, user.username, user.first_name)
     update_user_info(user.id, user.username, user.first_name)
@@ -283,6 +326,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None:
+        return
     context.user_data["waiting_for_prompt"] = False
     await send_main_menu(update.effective_chat.id, context, "📍 Asosiy menyu:")
 
@@ -297,14 +342,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Yangi userga {START_COINS} coin beriladi."
     )
 
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=main_menu_keyboard())
-    else:
+    if update.message:
         await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    elif update.callback_query and update.callback_query.message:
+        await update.callback_query.message.reply_text(
+            text,
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query is None or query.from_user is None or query.message is None:
+        return
+
     await query.answer()
 
     user = query.from_user
@@ -315,12 +366,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "create_music":
         context.user_data["waiting_for_prompt"] = True
-        await query.message.reply_text(build_prompt_help(), reply_markup=main_menu_keyboard())
+        await query.message.reply_text(
+            build_prompt_help(),
+            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
+        )
         return
 
     if data == "balance":
         context.user_data["waiting_for_prompt"] = False
-        await show_balance(query.message.chat_id, context, user.id)
+        await show_balance(query.message.chat.id, context, user.id)
         return
 
     if data == "help":
@@ -346,7 +400,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if update.message is None or update.message.text is None or update.effective_user is None:
         return
 
     user = update.effective_user
@@ -355,30 +409,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_or_create_user(user.id, user.username, user.first_name)
     update_user_info(user.id, user.username, user.first_name)
 
+    if not text:
+        await update.message.reply_text(
+            "⚠ Iltimos, bo‘sh prompt yubormang.",
+            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
+        )
+        return
+
+    if len(text) > MAX_PROMPT_LENGTH:
+        await update.message.reply_text(
+            f"⚠ Prompt juda uzun. Maksimal uzunlik: {MAX_PROMPT_LENGTH} ta belgi.",
+            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
+        )
+        return
+
     reserved_texts = {
         "/menu",
         "menu",
-        "🎵 create music",
-        "🪙 balance",
-        "ℹ help",
-        "❌ cancel",
         "help",
         "balance",
         "create music",
         "cancel",
+        "🎵 create music",
+        "🪙 balance",
+        "ℹ help",
+        "❌ cancel",
     }
 
-    if text.lower() in {"/menu", "menu"}:
+    lower_text = text.lower()
+
+    if lower_text in {"/menu", "menu"}:
         context.user_data["waiting_for_prompt"] = False
         await send_main_menu(update.effective_chat.id, context, "📍 Asosiy menyu:")
         return
 
-    if context.user_data.get("waiting_for_prompt") and text.lower() in reserved_texts:
+    if context.user_data.get("waiting_for_prompt") and lower_text in reserved_texts:
         await update.message.reply_text(
             "⚠ Hozir men sizdan musiqa prompti kutyapman.\n"
             "Masalan: cinematic piano with emotional strings\n\n"
             "Bekor qilish uchun ❌ Cancel ni bosing.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
         )
         return
 
@@ -390,6 +460,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_row = get_user(user.id)
+    if user_row is None:
+        context.user_data["waiting_for_prompt"] = False
+        await update.message.reply_text(
+            "❌ Foydalanuvchi bazadan topilmadi.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
     if user_row["coins"] < MUSIC_PRICE:
         context.user_data["waiting_for_prompt"] = False
         await update.message.reply_text(
@@ -404,7 +482,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not try_spend_coins(user.id, MUSIC_PRICE):
         context.user_data["waiting_for_prompt"] = False
         await update.message.reply_text(
-            "❌ Coin yechishda xatolik bo‘ldi.",
+            "❌ Coin yechishda xatolik bo‘ldi yoki coin yetarli emas.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -418,6 +496,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         audio_output = await generate_music(text)
+        logger.info("Replicate output: %r", audio_output)
+
         audio_url = get_output_url(audio_output)
 
         anim_task.cancel()
@@ -434,6 +514,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         increment_generation(user.id)
         current_user = get_user(user.id)
+
+        if current_user is None:
+            await status_msg.edit_text("✅ Musiqa tayyor!")
+            await send_main_menu(update.effective_chat.id, context, "Asosiy menyu:")
+            return
 
         await status_msg.edit_text("✅ Musiqa tayyor! Yuboryapman...")
         await context.bot.send_chat_action(
