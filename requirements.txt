@@ -1,2 +1,2 @@
 python-telegram-bot==21.10
-replicate==0.34.1
+replicate==1.0.4
