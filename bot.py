@@ -6,6 +6,7 @@ from contextlib import closing
 from typing import Optional, Any
 
 import replicate
+from replicate.exceptions import ReplicateError
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -25,9 +26,7 @@ if not BOT_TOKEN:
 if not REPLICATE_API_TOKEN:
     raise RuntimeError("REPLICATE_API_TOKEN topilmadi")
 
-os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
-
-MODEL = "meta/musicgen:671ac645ce5e552c63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
+MODEL = "meta/musicgen"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bot_data.db")
@@ -41,6 +40,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 
 def get_db():
@@ -180,6 +181,7 @@ def extract_url(value: Any) -> Optional[str]:
         return value
 
     url_attr = getattr(value, "url", None)
+
     if callable(url_attr):
         try:
             result = url_attr()
@@ -187,7 +189,8 @@ def extract_url(value: Any) -> Optional[str]:
                 return result
         except Exception:
             return None
-    elif isinstance(url_attr, str):
+
+    if isinstance(url_attr, str):
         return url_attr
 
     return None
@@ -201,7 +204,7 @@ def get_output_url(output: Any) -> Optional[str]:
     if direct:
         return direct
 
-    if isinstance(output, list) and output:
+    if isinstance(output, list):
         for item in output:
             item_url = extract_url(item)
             if item_url:
@@ -209,10 +212,10 @@ def get_output_url(output: Any) -> Optional[str]:
 
     if isinstance(output, dict):
         for key in ("url", "audio", "output", "file"):
-            possible = output.get(key)
-            possible_url = extract_url(possible)
-            if possible_url:
-                return possible_url
+            value = output.get(key)
+            item_url = extract_url(value)
+            if item_url:
+                return item_url
 
     return None
 
@@ -226,7 +229,7 @@ async def generate_music(prompt: str):
     }
 
     output = await asyncio.to_thread(
-        replicate.run,
+        replicate_client.run,
         MODEL,
         input=input_data,
     )
@@ -239,25 +242,29 @@ async def animated_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mess
         "🎵 Musiqa yaratilmoqda.",
         "🎵 Musiqa yaratilmoqda..",
         "🎵 Musiqa yaratilmoqda...",
-        "🎧 AI composing",
-        "🎼 Melody building",
-        "🥁 Beat layering",
-        "🎹 Finalizing track",
+        "🎧 AI composing...",
+        "🎼 Melody building...",
+        "🥁 Beat layering...",
+        "🎹 Finalizing track...",
     ]
 
     i = 0
+    last_text = None
+
     try:
         while True:
             text = frames[i % len(frames)]
 
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                )
-            except Exception as e:
-                logger.debug("Status edit error: %s", e)
+            if text != last_text:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                    )
+                    last_text = text
+                except Exception as e:
+                    logger.debug("Status edit error: %s", e)
 
             try:
                 await context.bot.send_chat_action(
@@ -409,20 +416,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_or_create_user(user.id, user.username, user.first_name)
     update_user_info(user.id, user.username, user.first_name)
 
-    if not text:
-        await update.message.reply_text(
-            "⚠ Iltimos, bo‘sh prompt yubormang.",
-            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
-        )
-        return
-
-    if len(text) > MAX_PROMPT_LENGTH:
-        await update.message.reply_text(
-            f"⚠ Prompt juda uzun. Maksimal uzunlik: {MAX_PROMPT_LENGTH} ta belgi.",
-            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
-        )
-        return
-
     reserved_texts = {
         "/menu",
         "menu",
@@ -459,6 +452,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if not text:
+        await update.message.reply_text(
+            "⚠ Iltimos, bo‘sh prompt yubormang.",
+            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
+        )
+        return
+
+    if len(text) > MAX_PROMPT_LENGTH:
+        await update.message.reply_text(
+            f"⚠ Prompt juda uzun. Maksimal uzunlik: {MAX_PROMPT_LENGTH} ta belgi.",
+            reply_markup=main_menu_keyboard(waiting_for_prompt=True),
+        )
+        return
+
     user_row = get_user(user.id)
     if user_row is None:
         context.user_data["waiting_for_prompt"] = False
@@ -489,7 +496,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["waiting_for_prompt"] = False
 
-    status_msg = await update.message.reply_text("🎵 Musiqa yaratilmoqda")
+    status_msg = await update.message.reply_text("🎵 Musiqa yaratilmoqda...")
     anim_task = asyncio.create_task(
         animated_status(context, update.effective_chat.id, status_msg.message_id)
     )
@@ -515,29 +522,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         increment_generation(user.id)
         current_user = get_user(user.id)
 
-        if current_user is None:
-            await status_msg.edit_text("✅ Musiqa tayyor!")
-            await send_main_menu(update.effective_chat.id, context, "Asosiy menyu:")
-            return
-
         await status_msg.edit_text("✅ Musiqa tayyor! Yuboryapman...")
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action=ChatAction.UPLOAD_AUDIO,
         )
-        await update.message.reply_audio(
-            audio=audio_url,
-            caption=(
+
+        caption = "🎧 Tayyor!"
+        if current_user is not None:
+            caption = (
                 "🎧 Tayyor!\n"
                 f"🪙 Qolgan coin: {current_user['coins']}\n"
                 f"💸 Sarflandi: {MUSIC_PRICE} coin"
-            ),
+            )
+
+        await update.message.reply_audio(
+            audio=audio_url,
+            caption=caption,
         )
+
         await send_main_menu(
             update.effective_chat.id,
             context,
             "Yana music yaratish uchun tugmani bosing.",
         )
+
+    except ReplicateError as e:
+        logger.exception("Replicate error: %s", e)
+
+        anim_task.cancel()
+        try:
+            await anim_task
+        except asyncio.CancelledError:
+            pass
+
+        refund_coins(user.id, MUSIC_PRICE)
+
+        await status_msg.edit_text(
+            f"❌ Replicate xatoligi:\n{str(e)[:350]}\n\nCoin qaytarildi."
+        )
+        await send_main_menu(update.effective_chat.id, context, "Asosiy menyu:")
 
     except Exception as e:
         logger.exception("Music generation error: %s", e)
@@ -551,8 +575,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         refund_coins(user.id, MUSIC_PRICE)
 
         await status_msg.edit_text(
-            "❌ Xatolik yuz berdi.\n"
-            "Coin qaytarildi."
+            f"❌ Xatolik yuz berdi:\n{str(e)[:350]}\n\nCoin qaytarildi."
         )
         await send_main_menu(update.effective_chat.id, context, "Asosiy menyu:")
 
@@ -569,7 +592,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot ishga tushdi...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
